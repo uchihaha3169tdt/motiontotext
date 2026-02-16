@@ -41,10 +41,10 @@ class TransformerEncoder(nn.TransformerEncoderLayer):
         return src
 
 class CSLRTransformer(nn.Module):
-    def __init__(self, num_classes, input_dim=42, d_model=512, nhead=8, num_layers=2, dropout=0.1):
+    def __init__(self, num_classes, input_dim=172, d_model=512, nhead=8, num_layers=2, dropout=0.1):
         super(CSLRTransformer, self).__init__()
         self.d_model = d_model
-        self.pose_embed = nn.Linear(input_dim*2, d_model)
+        self.pose_embed = nn.Linear(input_dim, d_model)
         self.positional_encoder = PositionalEncoding1D(d_model)
 
         self.transformer_encoder = nn.TransformerEncoder(

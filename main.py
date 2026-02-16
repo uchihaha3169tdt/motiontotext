@@ -5,18 +5,17 @@ import numpy as np
 import argparse
 import shutil
 import torch
-import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from torch.utils.data import DataLoader
 from utils.text_ctc_utils import * 
 from utils.decode import Decode
 from utils.metrics import wer_list
 from torchvision import transforms
 from utils.datasetv2 import PoseDatasetV2
+from utils.dataset_segments import SegmentNPYDataset, build_segment_text_for_ctc
 
 from models.transformer import CSLRTransformer
 
@@ -44,6 +43,34 @@ def make_workdir(work_dir):
 
     if not os.path.exists(os.path.join(work_dir, "pred_outputs")):
         os.mkdir(os.path.join(work_dir, "pred_outputs"))
+
+
+def resolve_legacy_annotation_files(mode):
+    ann_dir = os.path.join("./annotations_v2/isharah2000", mode)
+
+    train_csv = os.path.join(ann_dir, "train.csv")
+    dev_csv = os.path.join(ann_dir, "dev.csv")
+
+    if not os.path.exists(train_csv):
+        train_csv = os.path.join(ann_dir, "train.txt")
+    if not os.path.exists(dev_csv):
+        dev_csv = os.path.join(ann_dir, "dev.txt")
+
+    if not os.path.exists(train_csv) or not os.path.exists(dev_csv):
+        raise FileNotFoundError(
+            f"Could not find annotation files for mode={mode} in {ann_dir}."
+        )
+
+    return train_csv, dev_csv
+
+
+def infer_input_dim(dataset):
+    _, pose, _ = dataset[0]
+    if pose.ndim == 3:
+        return int(pose.shape[-2] * pose.shape[-1])
+    if pose.ndim == 2:
+        return int(pose.shape[-1])
+    return int(np.prod(pose.shape[1:]))
 
 def train_epoch(model, dataloader, optimizer, loss_encoder, device):
     total_loss = 0
@@ -106,18 +133,75 @@ def main(args):
     set_rng_state(42)
     make_workdir(args.work_dir)
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
-        
-    train_csv = f"./annotations_v2/isharah2000/{args.mode}/train.txt"
-    dev_csv = f"./annotations_v2/isharah2000/{args.mode}/dev.txt"
 
-    train_processed, dev_processed, vocab_map, inv_vocab_map, vocab_list = convert_text_for_ctc("isharah", train_csv, dev_csv)
+    if args.data_format == "legacy":
+        train_csv, dev_csv = resolve_legacy_annotation_files(args.mode)
+        train_processed, dev_processed, vocab_map, inv_vocab_map, vocab_list = convert_text_for_ctc(
+            "isharah", train_csv, dev_csv
+        )
 
-    dataset_train = PoseDatasetV2("isharah", train_csv , "train", train_processed , augmentations=True , transform=transforms.Compose([GaussianNoise()]), mode=args.mode)
-    dataset_dev = PoseDatasetV2("isharah", dev_csv , "dev", dev_processed, augmentations=False, mode=args.mode)
-    traindataloader = DataLoader(dataset_train, batch_size=1, shuffle=True, num_workers=10)
-    devdataloader = DataLoader(dataset_dev, batch_size=1, shuffle=False, num_workers=10)
-    
-    model = MODELS[args.model](input_dim=86, num_classes=len(vocab_map)).to(device)
+        dataset_train = PoseDatasetV2(
+            "isharah",
+            train_csv,
+            "train",
+            train_processed,
+            augmentations=True,
+            transform=transforms.Compose([GaussianNoise()]),
+            mode=args.mode,
+        )
+        dataset_dev = PoseDatasetV2(
+            "isharah",
+            dev_csv,
+            "dev",
+            dev_processed,
+            augmentations=False,
+            mode=args.mode,
+        )
+    else:
+        train_split = os.path.join(args.segments_root, args.train_split)
+        dev_split = os.path.join(args.segments_root, args.dev_split)
+
+        train_processed, dev_processed, vocab_map, inv_vocab_map, vocab_list = build_segment_text_for_ctc(
+            args.segments_root,
+            train_split,
+            dev_split,
+        )
+
+        dataset_train = SegmentNPYDataset(
+            dataset_root=args.segments_root,
+            split_file=train_split,
+            target_enc_df=train_processed,
+            transform=transforms.Compose([GaussianNoise()]),
+        )
+        dataset_dev = SegmentNPYDataset(
+            dataset_root=args.segments_root,
+            split_file=dev_split,
+            target_enc_df=dev_processed,
+        )
+
+    if len(dataset_train) == 0 or len(dataset_dev) == 0:
+        raise ValueError(
+            "Empty dataset split detected. Please verify split files and input data paths."
+        )
+
+    traindataloader = DataLoader(
+        dataset_train,
+        batch_size=1,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+    devdataloader = DataLoader(
+        dataset_dev,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    model_input_dim = infer_input_dim(dataset_train)
+    print(f"Detected model input_dim={model_input_dim}")
+    model = MODELS[args.model](input_dim=model_input_dim, num_classes=len(vocab_map)).to(device)
 
     decoder_dec = Decode(vocab_map, len(vocab_list), 'beam')
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -173,9 +257,15 @@ if __name__ == '__main__':
     parser.add_argument('--device', dest='device', default="0")
     parser.add_argument('--lr', dest='lr', default="0.0001")
     parser.add_argument('--num_epochs', dest='num_epochs', default="300")
+    parser.add_argument('--num_workers', dest='num_workers', default="0")
+    parser.add_argument('--data_format', dest='data_format', default="legacy", choices=["legacy", "segments"])
+    parser.add_argument('--segments_root', dest='segments_root', default="./data/YOUTUBE_SIGN")
+    parser.add_argument('--train_split', dest='train_split', default="train.txt")
+    parser.add_argument('--dev_split', dest='dev_split', default="val.txt")
 
     args=parser.parse_args()
     args.lr = float(args.lr)
     args.num_epochs = int(args.num_epochs)
+    args.num_workers = int(args.num_workers)
     
     main(args)
