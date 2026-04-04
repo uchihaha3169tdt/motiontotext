@@ -25,10 +25,29 @@ class TransformerEncoder(nn.TransformerEncoderLayer):
         super().__init__(*args, **kwargs)
         self.attention_weights = None
 
-    def forward(self, src, src_mask=None, src_key_padding_mask=None):
-        src2, attn_weights = self.self_attn(src, src, src, attn_mask=src_mask,
-                                            key_padding_mask=src_key_padding_mask,
-                                            need_weights=True, average_attn_weights=False)
+    def forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal=False):
+        try:
+            src2, attn_weights = self.self_attn(
+                src,
+                src,
+                src,
+                attn_mask=src_mask,
+                key_padding_mask=src_key_padding_mask,
+                need_weights=True,
+                average_attn_weights=False,
+                is_causal=is_causal,
+            )
+        except TypeError:
+            # Older torch versions do not support is_causal in MultiheadAttention.
+            src2, attn_weights = self.self_attn(
+                src,
+                src,
+                src,
+                attn_mask=src_mask,
+                key_padding_mask=src_key_padding_mask,
+                need_weights=True,
+                average_attn_weights=False,
+            )
         
         self.attention_weights = attn_weights.detach()  # save attention weights for visualization
         src = src + self.dropout1(src2)
