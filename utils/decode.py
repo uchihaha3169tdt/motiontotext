@@ -1,6 +1,12 @@
-import ctcdecode
 from itertools import groupby
+import warnings
+
 import torch
+
+try:
+    import ctcdecode
+except Exception:
+    ctcdecode = None
 
 class Decode(object):
     def __init__(self, gloss_dict, num_classes, search_mode, blank_id=0):
@@ -10,9 +16,23 @@ class Decode(object):
         self.num_classes = num_classes
         self.search_mode = search_mode
         self.blank_id = blank_id
-        vocab = [chr(x) for x in range(20000, 20000 + num_classes)]
-        self.ctc_decoder = ctcdecode.CTCBeamDecoder(vocab, beam_width=10, blank_id=blank_id,
-                                                    num_processes=10)
+        self.ctc_decoder = None
+
+        if self.search_mode != "max":
+            if ctcdecode is None:
+                warnings.warn(
+                    "ctcdecode is not installed. Falling back to max decoding.",
+                    RuntimeWarning,
+                )
+                self.search_mode = "max"
+            else:
+                vocab = [chr(x) for x in range(20000, 20000 + num_classes)]
+                self.ctc_decoder = ctcdecode.CTCBeamDecoder(
+                    vocab,
+                    beam_width=10,
+                    blank_id=blank_id,
+                    num_processes=10,
+                )
 
     def decode(self, nn_output, vid_lgt, batch_first=True, probs=False):
         if not batch_first:
@@ -23,6 +43,9 @@ class Decode(object):
             return self.BeamSearch(nn_output, vid_lgt, probs)
 
     def BeamSearch(self, nn_output, vid_lgt, probs=False):
+        if self.ctc_decoder is None:
+            return self.MaxDecode(nn_output, vid_lgt)
+
         if not probs:
             nn_output = nn_output.softmax(-1).cpu()
         vid_lgt = vid_lgt.cpu()
