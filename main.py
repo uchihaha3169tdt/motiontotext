@@ -301,12 +301,12 @@ def main(args):
             torch.save(model.state_dict(), f"{args.work_dir}/best_model.pt")
         else:
             patience_counter += 1
-        
-         log_msg = (f"Train Loss: {train_loss:.4f} "
-               f"- Dev WER: {dev_wer_results['wer']:.4f} - Best Dev WER: {best_wer:.4f} - Best epoch: {best_epoch+1} "
-             f"- Empty Preds: {dev_wer_results['empty_preds']}/{dev_wer_results['total_samples']} "
-             f"- Skipped Invalid CTC: {skipped_invalid_ctc} "
-             f"- Learning Rate: {current_lr:.8f}")
+
+        log_msg = (f"Train Loss: {train_loss:.4f} "
+                   f"- Dev WER: {dev_wer_results['wer']:.4f} - Best Dev WER: {best_wer:.4f} - Best epoch: {best_epoch+1} "
+                   f"- Empty Preds: {dev_wer_results['empty_preds']}/{dev_wer_results['total_samples']} "
+                   f"- Skipped Invalid CTC: {skipped_invalid_ctc} "
+                   f"- Learning Rate: {current_lr:.8f}")
         
         print(log_msg)
         with open(log_file, "a") as f:
