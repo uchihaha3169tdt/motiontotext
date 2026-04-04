@@ -125,14 +125,34 @@ def evaluate_model(model, dataloader, decoder_dec, device, inv_vocab_map, work_d
 
                 pred_file.write(f"GT: {ground_truth}\nPred: {current_preds}\n\n")
 
-    wer_results = wer_list(preds, gt_labels)
+    # wer_list expects (references, hypotheses) = (ground_truth, predictions)
+    wer_results = wer_list(gt_labels, preds)
     
     return wer_results
 
 def main(args):
     set_rng_state(42)
     make_workdir(args.work_dir)
-    device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
+    cuda_available = torch.cuda.is_available()
+    device = torch.device(f"cuda:{args.device}" if cuda_available else "cpu")
+
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA build in torch: {torch.version.cuda}")
+    print(f"CUDA available: {cuda_available}")
+    if cuda_available:
+        gpu_idx = int(args.device)
+        if gpu_idx < torch.cuda.device_count():
+            print(f"Using device: cuda:{gpu_idx} ({torch.cuda.get_device_name(gpu_idx)})")
+        else:
+            print(
+                f"Requested cuda:{gpu_idx} but only {torch.cuda.device_count()} GPU(s) detected. "
+                "Falling back to cuda:0."
+            )
+            device = torch.device("cuda:0")
+            print(f"Using device: cuda:0 ({torch.cuda.get_device_name(0)})")
+    else:
+        print("Using device: cpu")
+        print("Tip: On Kaggle, enable GPU Accelerator and avoid CPU-only torch wheels.")
 
     if args.data_format == "legacy":
         train_csv, dev_csv = resolve_legacy_annotation_files(args.mode)
