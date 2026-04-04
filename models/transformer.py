@@ -88,8 +88,9 @@ class CSLRTransformer(nn.Module):
 
         self.temporal_pool_1 = nn.AvgPool1d(kernel_size=2, stride=2)  
         self.temporal_pool_2 = nn.AvgPool1d(kernel_size=2, stride=2)
-        self.tcn_1 = nn.Conv1d(in_channels=d_model, out_channels=512, kernel_size=5, padding=1)
-        self.tcn_2 = nn.Conv1d(in_channels=512, out_channels=d_model, kernel_size=5, padding=1)
+        # Keep sequence length through convolutions so CTC has enough timesteps.
+        self.tcn_1 = nn.Conv1d(in_channels=d_model, out_channels=512, kernel_size=5, padding=2)
+        self.tcn_2 = nn.Conv1d(in_channels=512, out_channels=d_model, kernel_size=5, padding=2)
 
         self.fc = nn.Sequential(
             nn.Linear(d_model, 128),
