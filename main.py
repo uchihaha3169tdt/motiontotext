@@ -205,7 +205,7 @@ def main(args):
 
     decoder_dec = Decode(vocab_map, len(vocab_list), 'beam')
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
     loss_encoder = nn.CTCLoss(blank=0, zero_infinity=True, reduction='none')
 
     log_file = f"{args.work_dir}/training_log.txt"
