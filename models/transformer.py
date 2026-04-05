@@ -22,14 +22,11 @@ class PositionalEncoding1D(nn.Module):
 
 
 class TransformerEncoderLayer(nn.TransformerEncoderLayer):
-    """Pre-norm transformer encoder layer — more stable training than post-norm."""
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.attention_weights = None
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal=False):
-        # Pre-norm: normalize BEFORE attention
         src_norm = self.norm1(src)
         try:
             src2, attn = self.self_attn(
@@ -57,10 +54,8 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
 
 class CSLRTransformer(nn.Module):
     """
-    Transformer-based CSLR model with CTC output.
-
-    Downsampling: T -> T/2 only (single AvgPool).
-    With segment_min_len=96 -> output T=48, enough for mean 11 tokens.
+    Transformer CSLR với CTC.
+    Downsampling T -> T/2 (một pool duy nhất).
     """
     def __init__(self, num_classes, input_dim=231, d_model=256, nhead=4,
                  num_layers=2, dropout=0.1):
@@ -70,7 +65,7 @@ class CSLRTransformer(nn.Module):
             nn.Linear(input_dim, d_model),
             nn.LayerNorm(d_model),
         )
-        self.pos_enc = PositionalEncoding1D(d_model)
+        self.pos_enc    = PositionalEncoding1D(d_model)
         self.input_drop = nn.Dropout(p=0.1)
 
         def _make_encoder():
@@ -90,7 +85,6 @@ class CSLRTransformer(nn.Module):
         self.enc3 = _make_encoder()
         self.enc4 = _make_encoder()
 
-        # Single temporal pool: T -> T/2
         self.temporal_pool = nn.AvgPool1d(kernel_size=2, stride=2)
 
         self.tcn = nn.Sequential(
@@ -106,7 +100,7 @@ class CSLRTransformer(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.2),
             nn.Linear(d_model // 2, num_classes),
         )
 
@@ -128,18 +122,14 @@ class CSLRTransformer(nn.Module):
     def forward(self, poses):
         B, T = poses.shape[:2]
         x = poses.view(B, T, -1)
-
         x = self.pose_embed(x)
         x = self.input_drop(x + self.pos_enc(x))
-
         x = self.enc1(x)
         x = self.enc2(x) + x
         x = self.enc3(x) + x
         x = self.enc4(x) + x
-
         x = x.transpose(1, 2)
         x = self.temporal_pool(x)
         x = self.tcn(x)
         x = x.transpose(1, 2)
-
         return self.fc(x)   # (B, T/2, num_classes)

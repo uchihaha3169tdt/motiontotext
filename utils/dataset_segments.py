@@ -9,15 +9,12 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-# ── Keypoint layout produced by YouTubeToSignSAMProcessor ─────────────────────
-# Total: 231 dims = 77 joints × 3 coords
-#   [  0: 24] Body       8 joints × 3
-#   [ 24:105] Face      27 joints × 3
-#   [105:168] Left Hand 21 joints × 3
-#   [168:231] Right Hand21 joints × 3
+# Keypoint layout: 231 dims = 77 joints x 3
+# [  0: 24] Body 8j  [ 24:105] Face 27j
+# [105:168] LHand 21j  [168:231] RHand 21j
 IDX_LH_START = 105
 IDX_RH_START = 168
-HAND_DIMS    = 63    # 21 joints × 3
+HAND_DIMS    = 63
 
 
 def _read_split_ids(split_path):
@@ -26,10 +23,6 @@ def _read_split_ids(split_path):
         raise FileNotFoundError(f"Split file not found: {split_file}")
     with open(split_file, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
-
-
-def _extract_text_label(text_payload):
-    return normalize_vietnamese_text(text_payload.split("#", 1)[0])
 
 
 def normalize_vietnamese_text(text):
@@ -46,20 +39,16 @@ def normalize_vietnamese_text(text):
 
 def _read_text_label(text_file):
     with open(text_file, "r", encoding="utf-8") as f:
-        return _extract_text_label(f.read().strip())
+        raw = f.read().strip()
+    first = raw.split("#", 1)[0]
+    return normalize_vietnamese_text(first)
 
-
-# ── Vocabulary building — TRAIN ONLY, with OOV analysis ──────────────────────
 
 def build_segment_text_for_ctc(dataset_root, train_split, dev_split,
                                 min_freq=1, unk_token="<unk>"):
     """
-    Build vocabulary from TRAIN ONLY to avoid data leakage.
-    Val/test words not seen in train are mapped to <unk>.
-
-    Args:
-        min_freq  : minimum frequency in train to include in vocab (default 1 = all)
-        unk_token : token used for OOV words in val/test
+    Build vocabulary từ TRAIN ONLY.
+    OOV trong val/test → <unk>.
     """
     dataset_root = Path(dataset_root)
     text_dir     = dataset_root / "texts"
@@ -81,12 +70,11 @@ def build_segment_text_for_ctc(dataset_root, train_split, dev_split,
     train_data = build_df(train_ids)
     dev_data   = build_df(dev_ids)
 
-    # ── Build vocab from TRAIN only ────────────────────────────────────────
+    # Đếm tần suất từ trong train
     train_word_freq = Counter()
     for ann in train_data["gloss"]:
         train_word_freq.update(normalize_vietnamese_text(ann).split())
 
-    # Filter by min_freq
     train_vocab = {w for w, c in train_word_freq.items() if c >= min_freq}
 
     vocab_list    = ["_", unk_token] + sorted(train_vocab)
@@ -94,81 +82,63 @@ def build_segment_text_for_ctc(dataset_root, train_split, dev_split,
     inv_vocab_map = {i: g for i, g in enumerate(vocab_list)}
     unk_id        = vocab_map[unk_token]
 
-    # ── OOV Analysis ───────────────────────────────────────────────────────
+    # OOV analysis
     dev_word_freq = Counter()
     for ann in dev_data["gloss"]:
         dev_word_freq.update(normalize_vietnamese_text(ann).split())
-
     oov_words     = {w for w in dev_word_freq if w not in vocab_map}
-    oov_token_cnt = sum(dev_word_freq[w] for w in oov_words)
+    oov_cnt       = sum(dev_word_freq[w] for w in oov_words)
     total_dev_tok = sum(dev_word_freq.values())
 
     print(f"\n{'='*55}")
     print(f"Vocabulary built from TRAIN only")
-    print(f"  Train vocab size : {len(vocab_list)} tokens (blank + unk + words)")
-    print(f"  Train unique words: {len(train_vocab)}")
+    print(f"  Train vocab size  : {len(vocab_list)} (blank + unk + {len(train_vocab)} words)")
     print(f"  Dev unique words  : {len(dev_word_freq)}")
-    print(f"  OOV words in dev  : {len(oov_words)}  "
-          f"({oov_token_cnt}/{total_dev_tok} tokens = "
-          f"{100*oov_token_cnt/max(total_dev_tok,1):.1f}%)")
+    print(f"  OOV in dev        : {len(oov_words)} words | "
+          f"{oov_cnt}/{total_dev_tok} tokens = {100*oov_cnt/max(total_dev_tok,1):.1f}%")
     if oov_words:
-        top_oov = sorted(oov_words, key=lambda w: -dev_word_freq[w])[:10]
-        print(f"  Top OOV words     : {top_oov}")
+        top = sorted(oov_words, key=lambda w: -dev_word_freq[w])[:10]
+        print(f"  Top OOV           : {top}")
     print(f"{'='*55}\n")
 
-    # ── Encode — OOV → unk_id ──────────────────────────────────────────────
     def encode_annotations(df):
         df = df.copy()
         df["gloss"] = df["gloss"].apply(normalize_vietnamese_text)
         df["enc"]   = df["gloss"].apply(
             lambda x: [vocab_map.get(g, unk_id) for g in x.split()]
         )
-        # Drop samples where ALL tokens are unk (no signal)
+        # Bỏ sample mà toàn bộ token đều là unk
         df = df[df["enc"].apply(lambda e: any(t != unk_id for t in e))]
         return df[["id", "enc"]]
 
-    train_processed = encode_annotations(train_data)
-    dev_processed   = encode_annotations(dev_data)
-
-    return (train_processed, dev_processed,
+    return (encode_annotations(train_data), encode_annotations(dev_data),
             vocab_map, inv_vocab_map, vocab_list)
 
 
-# ── Missing-hand interpolation ─────────────────────────────────────────────────
+# ── Missing-hand interpolation ────────────────────────────────────────────────
 
 def _interpolate_missing_hand(seq, start, length):
-    """
-    Forward-fill then backward-fill frames where an entire hand is zero.
-    seq: (T, D) float32, modified in-place.
-    """
     hand    = seq[:, start:start + length]
     missing = (np.abs(hand).sum(axis=1) == 0)
-
     if missing.all():
-        return seq   # entire segment missing — leave zeros
-
-    # Forward fill
+        return seq
     last_valid = None
     for t in range(len(missing)):
         if not missing[t]:
             last_valid = hand[t].copy()
         elif last_valid is not None:
             hand[t] = last_valid
-
-    # Backward fill (leading missing frames)
     first_valid = None
     for t in range(len(missing) - 1, -1, -1):
         if not missing[t]:
             first_valid = hand[t].copy()
         elif first_valid is not None:
             hand[t] = first_valid
-
     seq[:, start:start + length] = hand
     return seq
 
 
 def fix_missing_hands(sequence):
-    """Apply interpolation to both hands. sequence: (T, D) float32."""
     sequence = _interpolate_missing_hand(sequence, IDX_LH_START, HAND_DIMS)
     sequence = _interpolate_missing_hand(sequence, IDX_RH_START, HAND_DIMS)
     return sequence
@@ -196,7 +166,6 @@ class SegmentNPYDataset(Dataset):
 
         self.files  = []
         self.labels = []
-
         for sid in self.ids:
             if ((self.motion_dir / f"{sid}.npy").exists()
                     and (self.text_dir / f"{sid}.txt").exists()

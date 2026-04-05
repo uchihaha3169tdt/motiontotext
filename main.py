@@ -58,41 +58,80 @@ def get_target_lengths(labels, blank_id=0):
     return (labels != blank_id).sum(dim=1).to(dtype=torch.long)
 
 
+def init_bias_against_blank(model, num_classes, blank_penalty=5.0):
+    """
+    Khởi tạo bias lớp cuối để model không bị collapse vào blank ngay từ đầu.
+    Đặt bias của blank token = -blank_penalty, các token khác = +bias nhỏ.
+    Đây là fix quan trọng nhất cho CTC với vocab lớn.
+    """
+    last_linear = None
+    for m in model.fc:
+        if isinstance(m, nn.Linear):
+            last_linear = m
+    if last_linear is not None and last_linear.bias is not None:
+        with torch.no_grad():
+            last_linear.bias.fill_(0.0)
+            # Phạt blank token nặng hơn để buộc model học predict non-blank
+            last_linear.bias[0] = -blank_penalty
+            # Khuyến khích uniform distribution trên các từ thực
+            last_linear.bias[1:] = blank_penalty / (num_classes - 1)
+    print(f"  Blank bias initialized to {-blank_penalty:.1f} "
+          f"(non-blank bias = +{blank_penalty/(num_classes-1):.4f})")
+
+
 def debug_first_batch(model, dataloader, device, inv_vocab_map):
-    """Sanity-check the first batch before training starts."""
     model.eval()
     with torch.no_grad():
         for sid, poses, labels in dataloader:
-            poses = poses.to(device)
-            logits = model(poses)
+            poses     = poses.to(device)
+            logits    = model(poses)
             log_probs = F.log_softmax(logits, dim=-1)
-            T_out    = logits.shape[1]
-            tgt_len  = (labels != 0).sum().item()
-            gt       = " ".join(invert_to_chars(labels, inv_vocab_map))
-            blank_p  = log_probs[0, :, 0].exp().mean().item()
-            status   = "OK" if T_out >= tgt_len else "BAD: T_out < target_len!"
-            print(f"  sample      : {sid[0]}")
-            print(f"  pose shape  : {poses.shape}")
-            print(f"  logits shape: {logits.shape}  (B, T_out, C)")
+            T_out     = logits.shape[1]
+            tgt_len   = (labels != 0).sum().item()
+            gt        = " ".join(invert_to_chars(labels, inv_vocab_map))
+            blank_p   = log_probs[0, :, 0].exp().mean().item()
+            top_ids   = logits[0, 0].topk(5).indices.tolist()
+            top_words = [inv_vocab_map.get(i, f"id={i}") for i in top_ids]
+            status    = "OK" if T_out >= tgt_len else "WARN: T_out < target_len!"
+            print(f"  sample        : {sid[0]}")
+            print(f"  pose shape    : {poses.shape}")
+            print(f"  logits shape  : {logits.shape}  (B, T_out, C)")
             print(f"  T_out={T_out}  target_len={tgt_len}  [{status}]")
-            print(f"  ground truth: {gt}")
-            print(f"  mean blank prob (random init ~1/C): {blank_p:.4f}")
+            print(f"  ground truth  : {gt}")
+            print(f"  blank prob    : {blank_p:.4f}  (target: < 0.1 after bias init)")
+            print(f"  top-5 tokens  : {top_words}")
             break
     model.train()
 
 
-def train_epoch(model, dataloader, optimizer, ctc_loss, device, grad_clip=5.0):
+def warmup_schedule(optimizer, step, warmup_steps, base_lr):
+    """Linear warmup — giúp tránh loss spike ở đầu."""
+    if step < warmup_steps:
+        lr = base_lr * (step + 1) / warmup_steps
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
+
+
+def train_epoch(model, dataloader, optimizer, ctc_loss, device,
+                grad_clip=5.0, epoch=0, warmup_steps=200, base_lr=3e-4):
     model.train()
     total_loss, valid_steps, skipped = 0.0, 0, 0
     current_lr = optimizer.param_groups[0]["lr"]
+    global_step = epoch * len(dataloader)
 
-    for _, poses, labels in tqdm(dataloader, desc="train", ncols=100):
+    for step, (_, poses, labels) in enumerate(
+            tqdm(dataloader, desc="train", ncols=100)):
+
+        # Warmup chỉ trong epoch đầu
+        if epoch == 0:
+            warmup_schedule(optimizer, global_step + step, warmup_steps, base_lr)
+
         optimizer.zero_grad()
         poses  = poses.to(device)
         labels = labels.to(device, dtype=torch.long)
 
         logits    = model(poses)
-        log_probs = F.log_softmax(logits, dim=-1).permute(1, 0, 2)  # (T, B, C)
+        log_probs = F.log_softmax(logits, dim=-1).permute(1, 0, 2)  # (T,B,C)
 
         T_out          = log_probs.size(0)
         B              = log_probs.size(1)
@@ -129,7 +168,8 @@ def evaluate_model(model, dataloader, decoder, device, inv_vocab_map,
     model.eval()
     preds, gt_labels = [], []
     empty_preds = 0
-    pred_path = os.path.join(work_dir, "pred_outputs", f"predictions_epoch_{epoch+1}.txt")
+    pred_path = os.path.join(work_dir, "pred_outputs",
+                             f"predictions_epoch_{epoch+1}.txt")
 
     with open(pred_path, "w", encoding="utf-8") as f:
         f.write(f"Epoch {epoch+1} Predictions\n{'='*50}\n")
@@ -141,9 +181,8 @@ def evaluate_model(model, dataloader, decoder, device, inv_vocab_map,
                     (logits.size(0),), logits.size(1),
                     dtype=torch.long, device=device,
                 )
-                decoded = decoder.decode(logits, vid_lgt=vid_lgt,
-                                         batch_first=True, probs=False)
-
+                decoded  = decoder.decode(logits, vid_lgt=vid_lgt,
+                                          batch_first=True, probs=False)
                 pred_str = " ".join(g for pred in decoded for g, _ in pred)
                 if not pred_str.strip():
                     empty_preds += 1
@@ -157,12 +196,9 @@ def evaluate_model(model, dataloader, decoder, device, inv_vocab_map,
     results["empty_preds"]   = empty_preds
     results["total_samples"] = len(preds)
 
-    # OOV rate in predictions (how often model outputs <unk>)
-    all_pred_tokens = " ".join(preds).split()
-    unk_pred_cnt    = all_pred_tokens.count(unk_token)
-    results["unk_pred_rate"] = (
-        unk_pred_cnt / max(len(all_pred_tokens), 1) * 100
-    )
+    all_pred_tokens       = " ".join(preds).split()
+    unk_cnt               = all_pred_tokens.count(unk_token)
+    results["unk_pred_rate"] = unk_cnt / max(len(all_pred_tokens), 1) * 100
     return results
 
 
@@ -175,7 +211,7 @@ def build_datasets(args):
         ds_train = PoseDatasetV2(
             "isharah", train_csv, "train", train_proc,
             augmentations=True,
-            transform=transforms.Compose([GaussianNoise(std=0.05)]),
+            transform=transforms.Compose([GaussianNoise(std=0.02)]),
             mode=args.mode,
         )
         ds_dev = PoseDatasetV2(
@@ -193,7 +229,7 @@ def build_datasets(args):
         )
         ds_train = SegmentNPYDataset(
             args.segments_root, train_split, train_proc,
-            transform=transforms.Compose([GaussianNoise(std=0.05)]),
+            transform=transforms.Compose([GaussianNoise(std=0.02)]),
             min_len=args.segment_min_len,
             max_len=args.segment_max_len,
         )
@@ -219,11 +255,10 @@ def main(args):
         raise ValueError("Empty dataset split detected.")
 
     train_label_lens = [len(lbl) for lbl in ds_train.labels]
-    print(f"Train: {len(ds_train)} samples | "
-          f"label len mean={np.mean(train_label_lens):.1f} "
+    print(f"Train: {len(ds_train)} | label mean={np.mean(train_label_lens):.1f} "
           f"max={np.max(train_label_lens)} min={np.min(train_label_lens)}")
-    print(f"Dev  : {len(ds_dev)} samples")
-    print(f"Vocab: {len(vocab_map)} tokens (blank + <unk> + words)")
+    print(f"Dev  : {len(ds_dev)}")
+    print(f"Vocab: {len(vocab_map)} tokens")
 
     pin          = torch.cuda.is_available()
     train_loader = DataLoader(ds_train, batch_size=1, shuffle=True,
@@ -243,13 +278,20 @@ def main(args):
         dropout=args.dropout,
     ).to(device)
 
+    # ── FIX QUAN TRỌNG NHẤT: khởi tạo bias để tránh blank collapse ────────
+    print("\nInitializing output bias to prevent blank collapse...")
+    init_bias_against_blank(model, num_classes=len(vocab_map),
+                            blank_penalty=args.blank_penalty)
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params: {n_params:,}")
 
     decoder   = Decode(vocab_map, len(vocab_list), "beam")
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6
+
+    # CosineAnnealingLR tốt hơn ReduceLROnPlateau cho CTC training
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.num_epochs, eta_min=1e-6
     )
     ctc_loss  = nn.CTCLoss(blank=0, zero_infinity=True, reduction="none")
 
@@ -269,12 +311,15 @@ def main(args):
         train_loss, lr, skipped = train_epoch(
             model, train_loader, optimizer, ctc_loss, device,
             grad_clip=args.grad_clip,
+            epoch=epoch,
+            warmup_steps=args.warmup_steps,
+            base_lr=args.lr,
         )
         wer_results = evaluate_model(
             model, dev_loader, decoder, device, inv_vocab_map,
             args.work_dir, epoch,
         )
-        scheduler.step(wer_results["wer"])
+        scheduler.step()
 
         if wer_results["wer"] < best_wer:
             best_wer, best_epoch, patience_counter = wer_results["wer"], epoch, 0
@@ -291,7 +336,7 @@ def main(args):
             f"SUB={wer_results['sub']:.2f} | "
             f"BestWER={best_wer:.2f}(ep{best_epoch+1}) | "
             f"Empty={wer_results['empty_preds']}/{wer_results['total_samples']} | "
-            f"UNK_pred={wer_results['unk_pred_rate']:.1f}% | "
+            f"UNK={wer_results['unk_pred_rate']:.1f}% | "
             f"Skipped={skipped} | LR={lr:.2e}"
         )
         print(msg)
@@ -322,13 +367,17 @@ if __name__ == "__main__":
     parser.add_argument("--segment_max_len", type=int,   default=1000)
     # Vocab
     parser.add_argument("--min_freq",        type=int,   default=1,
-                        help="Min word freq in train to include in vocab (OOV control)")
+                        help="Min word freq in train to keep in vocab")
     # Training
     parser.add_argument("--lr",              type=float, default=3e-4)
     parser.add_argument("--num_epochs",      type=int,   default=300)
     parser.add_argument("--num_workers",     type=int,   default=0)
-    parser.add_argument("--patience",        type=int,   default=15)
+    parser.add_argument("--patience",        type=int,   default=20)
     parser.add_argument("--grad_clip",       type=float, default=5.0)
+    parser.add_argument("--warmup_steps",    type=int,   default=500,
+                        help="Linear LR warmup steps")
+    parser.add_argument("--blank_penalty",   type=float, default=5.0,
+                        help="Bias penalty on blank token to prevent CTC collapse")
     # Model
     parser.add_argument("--d_model",         type=int,   default=256)
     parser.add_argument("--nhead",           type=int,   default=4)
