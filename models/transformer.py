@@ -22,16 +22,18 @@ class PositionalEncoding1D(nn.Module):
 
 
 class TransformerEncoderLayer(nn.TransformerEncoderLayer):
-    """Standard encoder layer that stores attention weights for inspection."""
+    """Pre-norm transformer encoder layer — more stable training than post-norm."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.attention_weights = None
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal=False):
+        # Pre-norm: normalize BEFORE attention
+        src_norm = self.norm1(src)
         try:
             src2, attn = self.self_attn(
-                src, src, src,
+                src_norm, src_norm, src_norm,
                 attn_mask=src_mask,
                 key_padding_mask=src_key_padding_mask,
                 need_weights=True,
@@ -40,27 +42,46 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
             )
         except TypeError:
             src2, attn = self.self_attn(
-                src, src, src,
+                src_norm, src_norm, src_norm,
                 attn_mask=src_mask,
                 key_padding_mask=src_key_padding_mask,
                 need_weights=True,
                 average_attn_weights=False,
             )
         self.attention_weights = attn.detach()
-        src = self.norm1(src + self.dropout1(src2))
-        src = self.norm2(src + self.dropout2(self.linear2(self.dropout(self.activation(self.linear1(src))))))
+        src = src + self.dropout1(src2)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(self.norm2(src)))))
+        src = src + self.dropout2(src2)
         return src
 
 
 class CSLRTransformer(nn.Module):
-    def __init__(self, num_classes, input_dim=231, d_model=512, nhead=8, num_layers=2, dropout=0.1):
+    """
+    Transformer-based CSLR model with CTC output.
+
+    Downsampling: T -> T/2 only (single AvgPool).
+    With segment_min_len=96 -> output T=48, enough for mean 11 tokens.
+    """
+    def __init__(self, num_classes, input_dim=231, d_model=256, nhead=4,
+                 num_layers=2, dropout=0.1):
         super().__init__()
-        self.pose_embed = nn.Linear(input_dim, d_model)
+
+        self.pose_embed = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
         self.pos_enc = PositionalEncoding1D(d_model)
+        self.input_drop = nn.Dropout(p=0.1)
 
         def _make_encoder():
             return nn.TransformerEncoder(
-                TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True),
+                TransformerEncoderLayer(
+                    d_model=d_model, nhead=nhead,
+                    dim_feedforward=d_model * 4,
+                    dropout=dropout,
+                    batch_first=True,
+                    norm_first=False,
+                ),
                 num_layers=num_layers,
             )
 
@@ -69,36 +90,56 @@ class CSLRTransformer(nn.Module):
         self.enc3 = _make_encoder()
         self.enc4 = _make_encoder()
 
-        self.pool1 = nn.AvgPool1d(kernel_size=2, stride=2)
-        self.tcn1  = nn.Conv1d(d_model, d_model, kernel_size=5, padding=2)
-        self.pool2 = nn.AvgPool1d(kernel_size=2, stride=2)
-        self.tcn2  = nn.Conv1d(d_model, d_model, kernel_size=5, padding=2)
+        # Single temporal pool: T -> T/2
+        self.temporal_pool = nn.AvgPool1d(kernel_size=2, stride=2)
+
+        self.tcn = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+            nn.Dropout(p=0.1),
+            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+        )
 
         self.fc = nn.Sequential(
-            nn.Linear(d_model, 128),
-            nn.Dropout(0.2),
-            nn.Linear(128, num_classes),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(d_model // 2, num_classes),
         )
-        print(f"CSLRTransformer | input_dim={input_dim} | num_classes={num_classes} | d_model={d_model}")
+
+        self._init_weights()
+        print(f"CSLRTransformer | input_dim={input_dim} | num_classes={num_classes} "
+              f"| d_model={d_model} | nhead={nhead} | pool=T/2")
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, poses):
-        # poses: (B, T, J, D) or (B, T, D)
         B, T = poses.shape[:2]
-        x = poses.view(B, T, -1)          # (B, T, input_dim)
-        x = self.pose_embed(x)             # (B, T, d_model)
-        x = x + self.pos_enc(x)
+        x = poses.view(B, T, -1)
+
+        x = self.pose_embed(x)
+        x = self.input_drop(x + self.pos_enc(x))
 
         x = self.enc1(x)
         x = self.enc2(x) + x
         x = self.enc3(x) + x
         x = self.enc4(x) + x
 
-        # temporal downsampling: T -> T/4
-        x = x.transpose(1, 2)             # (B, d_model, T)
-        x = self.pool1(x)
-        x = torch.relu(self.tcn1(x))
-        x = self.pool2(x)
-        x = torch.relu(self.tcn2(x))
-        x = x.transpose(1, 2)             # (B, T/4, d_model)
+        x = x.transpose(1, 2)
+        x = self.temporal_pool(x)
+        x = self.tcn(x)
+        x = x.transpose(1, 2)
 
-        return self.fc(x)                  # (B, T/4, num_classes)
+        return self.fc(x)   # (B, T/2, num_classes)
